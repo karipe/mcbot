@@ -9,17 +9,19 @@ import socket
 import time
 import signal
 import traceback
-import zmq
+import pipes
+#import zmq
 
-if len(sys.argv) < 8:
-    print('Usage: python %s <host> <port> <nick> <channel> <readsock> <writesock> <worldpath>' % sys.argv[0], file=sys.stderr)
+if len(sys.argv) < 6:
+    print('Usage: python %s <server> <port> <nick> <channel> <worldpath>' % sys.argv[0], file=sys.stderr)
     print('  First 4 arguments specify IRC connection; next 2 arguments specify 0proxy socket paths; the last specifies a path to MC world.')
-    print('  Example: irc.ozinger.org 6670 mybot mychannel ipc:///var/run/mcbot/read ipc:///var/run/mcbot/write /var/run/minecraft/world', file=sys.stderr)
+    print('  Example: irc.ozinger.org 6670 mybot mychannel /var/run/minecraft/world', file=sys.stderr)
     raise SystemExit(1)
 
 LINEPARSE = re.compile("^(:(?P<prefix>[^ ]+) +)?(?P<command>[^ ]+)(?P<param>( +[^:][^ ]*)*)(?: +:(?P<message>.*))?$")
 
 s = socket.create_connection((sys.argv[1], sys.argv[2]))
+s.setblocking(0)
 NICK = sys.argv[3]
 CHANNEL = sys.argv[4]
 
@@ -53,22 +55,24 @@ def safeexec(to, f, args=(), kwargs={}):
         raise ExecutionTimedOut('execution timed out')
     try:
         try:
-            signal.signal(signal.SIGALRM, alarm)
-            signal.alarm(botimpl.TIMEOUT)
+            #signal.signal(signal.SIGALRM, alarm)
+            #signal.alarm(botimpl.TIMEOUT)
             f(*args, **kwargs)
         except Exception:
             sayerr(to)
         finally:
-            signal.signal(signal.SIGALRM, signal.SIG_DFL)
-            signal.alarm(0)
+            #signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            #signal.alarm(0)
+            pass
     except ExecutionTimedOut:
-        signal.signal(signal.SIGALRM, signal.SIG_DFL)
-        signal.alarm(0)
+        #signal.signal(signal.SIGALRM, signal.SIG_DFL)
+        #signal.alarm(0)
+        pass
 
 
 LIST_FLAG = False
 class Handler(object):
-    LOG_REX = re.compile(r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \[([A-Z]+)\] (.*)$')
+    LOG_REX = re.compile(r'^\[\d\d:\d\d:\d\d\] \[Server thread\/([A-Z]+)\]\: (.*)$')
     IGN_REX = re.compile(r'^(?:\d+ recipes|\d+ achievements|Closing listening thread)$')
     EXC_REX = re.compile(r'^(?:[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+: .*|\tat .*)$')
     LIST_HEADER_REX = re.compile(r'^There are (\d+)/\d+ players online:$')
@@ -127,53 +131,45 @@ class Handler(object):
 
     def on_line(self, line):
         m = self.LOG_REX.search(line)
-        if m: return self.on_log(m.group(1), m.group(2).decode('utf-8', 'replace'))
+        if m: return self.on_log(m.group(1), m.group(2).decode('cp949', 'replace'))
         if self.EXC_REX.search(line): return self.on_exception(line)
         if self.IGN_REX.search(line): return True
 
 is_players = False
 
+import subprocess, shlex, os
+
 class Pipe(object):
-    def __init__(self, read, write):
-        self.context = zmq.Context()
-        self.inpath = read
-        self.outpath = write
-        self._stdin = self._stdout = None
-
-    @property
-    def stdin(self):
-        if not self._stdin:
-            self._stdin = self.context.socket(zmq.SUB)
-            self._stdin.connect(self.inpath)
-            self._stdin.setsockopt(zmq.SUBSCRIBE, '')
-        return self._stdin
-
-    @property
-    def stdout(self):
-        if not self._stdout:
-            self._stdout = self.context.socket(zmq.REQ)
-            self._stdout.connect(self.outpath)
-        return self._stdout
+    def __init__(self, recv, send):
+        self.recv_p = recv
+        self.send_p = send
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('0.0.0.0', self.recv_p))
+        self.sock.setblocking(0)
 
     def send(self, *args):
-        line = ' '.join(arg.encode('utf-8') if isinstance(arg, unicode) else arg for arg in args)
-        self.stdout.send(line)
-        msg = self.stdout.recv()
-        assert msg == ''
+        line = ' '.join(arg.encode('cp949', errors='replace') if isinstance(arg, unicode) else arg for arg in args)
+        self.sock.sendto(line + "\n", ('127.0.0.1', self.send_p))
+        #msg = self.stdout.read()
+        #assert msg == ''
 
     def recv(self):
-        return self.stdin.recv()
+        try:
+            msg, sock = self.sock.recvfrom(65536)
+        except socket.error as inst:
+            msg = ""
+        return msg
 
     def __getattr__(self, name):
         def wrapper(*args): return self.send(name, *args)
         return wrapper
 
-pipe = Pipe(read=sys.argv[5], write=sys.argv[6])
-assert pipe.stdin and pipe.stdout
 
-WORLDPATH = sys.argv[7]
+pipe = Pipe(recv=25561, send=25560)
 
-
+WORLDPATH = sys.argv[5]
+
+
 def update_excepthook(pipe):
     origexcepthook = sys.excepthook
     def excepthook(ty, exc, tb):
@@ -182,17 +178,16 @@ def update_excepthook(pipe):
     sys.excepthook = excepthook
 
 def loop(pipe):
-    poller = zmq.Poller()
-    poller.register(pipe.stdin, zmq.POLLIN)
-    poller.register(s, zmq.POLLIN)
-
     send('USER kaede kaede ruree.net :Furutani Kaede')
     send('NICK %s' % NICK)
     nexttime = time.time() + botimpl.TICK
     while True:
         line = ''
         while not line.endswith('\r\n'):
-            ch = s.recv(1)
+            try:
+                ch = s.recv(1)
+            except socket.error:
+                ch = ''
             if ch == '': break
             line += ch
         line = line.rstrip('\r\n')
@@ -226,10 +221,10 @@ def loop(pipe):
                     safeexec(None, getattr(botimpl, 'line', None), (command, prefix, param, message))
 
         while True:
-            result = poller.poll(max(0, nexttime - time.time()) * 1000) # msec!
+            result = True # msec!
             if result:
-                if any(f is pipe.stdin for f, ev in result):
-                    line = pipe.recv()
+                line = pipe.recv()
+                if line:
                     safeexec(None, getattr(botimpl, 'handle', None), (line,))
                     continue
                 break
